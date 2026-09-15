@@ -1,0 +1,327 @@
+id: bottleneck_traitement
+namespace: bottleneck
+
+description: Workflow d'exécution de traitement des données  pour déterminer les vins premium et les vins ordinnaires ainsi que le CA. Flow exécuté tous les 15 du mois à 9h
+
+triggers:
+- id: scheduler
+  type: io.kestra.plugin.core.trigger.Schedule
+  cron: "0 9 15 * *"
+
+retry:
+  maxAttempts: 3
+  behavior: RETRY_FAILED_TASK
+  type: constant
+  interval: PT30S
+
+errors:
+  - id: log_echec
+    type: io.kestra.plugin.core.log.Log
+    message: "Échec du traitement BottleNeck — exécution {{ execution.id }}, tâche en erreur : {{ errorLogs() }}"
+
+tasks:
+  - id: parallele_cleaning
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      - id: branche_erp
+        type: io.kestra.plugin.core.flow.Sequential
+        tasks:
+          - id: extract_erp
+            type: io.kestra.plugin.core.http.Download
+            description: import du fichier erp au format csv
+            uri: https://raw.githubusercontent.com/ThomaSiesse/Projet_10/refs/heads/main/data/erp.csv
+
+          - id: cleaning_erp
+            type: io.kestra.plugin.jdbc.duckdb.Query
+            inputFiles:
+              erp_clean.csv: "{{ outputs.extract_erp.uri }}"
+            sql: COPY ( SELECT DISTINCT ON (product_id) * FROM read_csv_auto('{{ workingDir }}/erp_clean.csv', header=True) ORDER BY product_id ) TO '{{ outputFiles.out }}' (HEADER, DELIMITER ',');
+            outputFiles:
+              - out
+              
+          - id: check_valeurs_manquantes_erp
+            type: io.kestra.plugin.jdbc.duckdb.Query
+            description: check de valeurs manquantes
+            inputFiles:
+              erp.csv: "{{ outputs.cleaning_erp.outputFiles.out }}"
+            fetchType: FETCH_ONE
+            sql: "SELECT COUNT (*) AS nb FROM read_csv_auto('{{ workingDir }}/erp.csv', header=True) WHERE product_id IS NULL;"
+
+          - id: assert_valeurs_manquantes_erp
+            type: io.kestra.plugin.core.execution.Assert
+            conditions:
+              - "{{ outputs.check_valeurs_manquantes_erp.row.nb == 0 }}"
+            errorMessage: "erp_clean.csv possèdes encore des valeurs manquantes, ({{ outputs.check_valeurs_manquantes_erp.row.nb }} au lieu de 0)."
+          
+          - id: check_doublons_erp
+            type: io.kestra.plugin.jdbc.duckdb.Query
+            description: check de doublons
+            inputFiles:
+              erp.csv: "{{ outputs.cleaning_erp.outputFiles.out }}"
+            fetchType: FETCH_ONE
+            sql: |
+              SELECT COUNT(*) AS nbr_doublon
+              FROM (
+                SELECT product_id
+                FROM read_csv_auto('{{ workingDir }}/erp.csv', header=True)
+                GROUP BY product_id
+                HAVING COUNT(*) > 1
+              )t;
+
+          - id: assert_doublons_erp
+            type: io.kestra.plugin.core.execution.Assert
+            conditions:
+              - "{{ outputs.check_doublons_erp.row.nbr_doublon == 0 }}"
+            errorMessage: "erp.csv possède encore {{ outputs.check_doublons_erp.row.nbr_doublon }} product_id en doublon."
+
+      - id: branche_web
+        type: io.kestra.plugin.core.flow.Sequential
+        tasks:
+          - id: extract_web
+            type: io.kestra.plugin.core.http.Download
+            description: import du fichier web au format csv
+            uri: https://raw.githubusercontent.com/ThomaSiesse/Projet_10/refs/heads/main/data/web.csv
+
+          - id: cleaning_web
+            type: io.kestra.plugin.jdbc.duckdb.Query
+            inputFiles:
+              web_clean.csv: "{{ outputs.extract_web.uri }}"
+            sql: COPY ( SELECT * FROM read_csv_auto('{{ workingDir }}/web_clean.csv', header=True) WHERE post_type = 'product' AND sku IS NOT NULL AND TRIM(sku) != '' AND total_sales IS NOT NULL ) TO '{{ outputFiles.out }}' (HEADER, DELIMITER ',');
+            outputFiles:
+              - out
+          - id: check_valeurs_manquantes_web
+            type: io.kestra.plugin.jdbc.duckdb.Query
+            description: check de valeurs manquantes
+            inputFiles:
+              web.csv: "{{ outputs.cleaning_web.outputFiles.out }}"
+            fetchType: FETCH_ONE
+            sql: "SELECT COUNT (*) AS nb FROM read_csv_auto('{{ workingDir }}/web.csv', header=True) WHERE sku IS NULL;"
+
+          - id: assert_valeurs_manquantes_web
+            type: io.kestra.plugin.core.execution.Assert
+            conditions:
+              - "{{ outputs.check_valeurs_manquantes_web.row.nb == 0 }}"
+            errorMessage: "web_clean.csv possèdes encore des valeurs manquantes, ({{ outputs.check_valeurs_manquantes_web.row.nb }} au lieu de 0)."
+          
+          - id: check_doublons_web
+            type: io.kestra.plugin.jdbc.duckdb.Query
+            description: check de doublons
+            inputFiles:
+              web.csv: "{{ outputs.cleaning_web.outputFiles.out }}"
+            fetchType: FETCH_ONE
+            sql: |
+              SELECT COUNT(*) AS nbr_doublon
+              FROM (
+                SELECT sku
+                FROM read_csv_auto('{{ workingDir }}/web.csv', header=True)
+                GROUP BY sku
+                HAVING COUNT(*) > 1
+              )t;
+
+          - id: assert_doublons_web
+            type: io.kestra.plugin.core.execution.Assert
+            conditions:
+              - "{{ outputs.check_doublons_web.row.nbr_doublon == 0 }}"
+            errorMessage: "web.csv possède encore {{ outputs.check_doublons_web.row.nbr_doublon }} sku en doublon."
+
+  - id: extract_liaison
+    type: io.kestra.plugin.core.http.Download
+    uri: https://raw.githubusercontent.com/ThomaSiesse/Projet_10/refs/heads/main/data/liaison.csv
+    description: import donnée liaison
+
+  - id: cleaning_liaison
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    inputFiles:
+      liaison_clean.csv: "{{ outputs.extract_liaison.uri }}"
+    sql: |
+      COPY (
+        SELECT DISTINCT ON (product_id) *
+        FROM read_csv_auto('{{ workingDir }}/liaison_clean.csv', header=True)
+        ORDER BY product_id
+      ) TO '{{ outputFiles.out }}' (HEADER, DELIMITER ',');
+    outputFiles:
+      - out
+  - id: check_valeurs_manquantes_liaison
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    description: check de valeurs manquantes
+    inputFiles:
+      liaison.csv: "{{ outputs.cleaning_liaison.outputFiles.out }}"
+    fetchType: FETCH_ONE
+    sql: "SELECT COUNT (*) AS nb FROM read_csv_auto('{{ workingDir }}/liaison.csv', header=True) WHERE product_id IS NULL;"
+
+  - id: assert_valeurs_manquantes_liaison
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.check_valeurs_manquantes_liaison.row.nb == 0 }}"
+    errorMessage: "liaison_clean.csv possèdes encore des valeurs manquantes, ({{ outputs.check_valeurs_manquantes_liaison.row.nb }} au lieu de 0)."
+  
+  - id: check_doublons_liaison
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    description: check de doublons
+    inputFiles:
+      liaison.csv: "{{ outputs.cleaning_liaison.outputFiles.out }}"
+    fetchType: FETCH_ONE
+    sql: |
+        SELECT COUNT(*) AS nbr_doublon
+        FROM (
+          SELECT product_id
+          FROM read_csv_auto('{{ workingDir }}/liaison.csv', header=True)
+          GROUP BY product_id
+          HAVING COUNT(*) > 1
+        )t;
+
+  - id: assert_doublons_liaison
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.check_doublons_liaison.row.nbr_doublon == 0 }}"
+    errorMessage: "liaison.csv possède encore {{ outputs.check_doublons_liaison.row.nbr_doublon }} product_id en doublon."
+
+  - id: fusion
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    description: fusion des fichier ERP et WEB via la clé liaison
+    inputFiles:
+      erp_clean.csv: "{{ outputs.cleaning_erp.outputFiles.out }}"
+      web_clean.csv: "{{ outputs.cleaning_web.outputFiles.out }}"
+      liaison_clean.csv: "{{ outputs.cleaning_liaison.outputFiles.out }}"
+    sql: COPY ( SELECT web.*, erp.* FROM read_csv_auto('{{ workingDir }}/web_clean.csv', header=True) AS web LEFT JOIN read_csv_auto('{{ workingDir }}/liaison_clean.csv', header=True) AS liaison ON web.sku = liaison.id_web LEFT JOIN read_csv_auto('{{ workingDir }}/erp_clean.csv', header=True) AS erp ON liaison.product_id = erp.product_id ) TO '{{ outputFiles.out }}' (HEADER, DELIMITER ',');
+    outputFiles:
+      - out
+
+  - id: check_jointure_fusion
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    description: vérifie l'absence de lignes non-jointes
+    inputFiles:
+      fusion.csv: "{{ outputs.fusion.outputFiles.out }}"
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT COUNT(*) AS nb_orphelins
+      FROM read_csv_auto('{{ workingDir }}/fusion.csv', header=True)
+      WHERE price IS NULL;
+
+  - id: assert_jointure_fusion
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.check_jointure_fusion.row.nb_orphelins == 0 }}"
+    errorMessage: "{{ outputs.check_jointure_fusion.row.nb_orphelins }} lignes n'ont pas été joint correctement."
+
+  - id: calcul_CA
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    description: calcul du CA par vin et du CA total
+    inputFiles:
+      fusion.csv: "{{ outputs.fusion.outputFiles.out }}"
+    sql: |
+      COPY (
+        WITH ca_par_produit AS (
+          SELECT
+            product_id,
+            sku,
+            post_title,
+            price,
+            total_sales,
+            ROUND(price * total_sales ,2) AS ca
+          FROM read_csv_auto('{{ workingDir }}/fusion.csv', header=True)
+        )
+        SELECT
+          *,
+          ROUND(SUM(ca) OVER (),2) AS ca_total
+        FROM ca_par_produit
+      ) TO '{{ outputFiles['resultat_ca.csv'] }}' (HEADER, DELIMITER ',');
+    outputFiles:
+      - resultat_ca.csv
+
+  - id: export_ca_excel
+    type: io.kestra.plugin.scripts.python.Script
+    description: conversion du rapport CA fichier Excel pour les équipes produit
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install pandas openpyxl > /dev/null
+    inputFiles:
+      resultat_ca.csv: "{{ outputs.calcul_CA.outputFiles['resultat_ca.csv'] }}"
+    script: |
+      import pandas as pd
+
+      df = pd.read_csv("resultat_ca.csv")
+      df.to_excel("resultat_ca.xlsx", index=False, sheet_name="CA par produit")
+    outputFiles:
+      - resultat_ca.xlsx
+
+  - id: check_CA
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    inputFiles:
+      CA.csv: "{{ outputs.calcul_CA.outputFiles['resultat_ca.csv'] }}"
+    fetchType: FETCH_ONE          
+    sql: "SELECT
+            ROUND(SUM(ca), 2) AS somme_calculee,
+            MAX(ca_total) AS total_affiche
+          FROM read_csv_auto('{{ workingDir }}/CA.csv', header=True);"
+
+  - id: assert_CA
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.check_CA.row.somme_calculee == outputs.check_CA.row.total_affiche }}"
+    errorMessage: "Le chiffres d'affaire n'est pas bon. "
+
+  - id: zscore
+    type: io.kestra.plugin.scripts.python.Script
+    description: déterminer la gamme des vins à l'aide du z-score
+    containerImage: python:slim
+    beforeCommands:
+      - pip install pandas
+    inputFiles:
+      fusion.csv: "{{ outputs.fusion.outputFiles.out }}"
+    warningOnStdErr: false
+    script: |
+      import pandas as pd
+
+      df_erp = pd.read_csv('fusion.csv')
+
+      # Calcul du z-score
+      z_scores = (df_erp["price"] - df_erp["price"].mean()) / df_erp["price"].std().round(2)
+      df_erp["z_score"] = z_scores.round(2)
+
+      nb_premium = (df_erp["z_score"] >= 2).sum()
+      print(f"Le nombre de vins premium est de {nb_premium}")
+
+      # Export des vins premium et ordinaires au format csv
+      df_erp.loc[df_erp["z_score"] >= 2, ['post_title','product_id','sku','price','z_score']].to_csv("vin_premium.csv", index=False)
+      df_erp.loc[df_erp["z_score"] < 2, ['post_title','product_id','sku','price','z_score']].to_csv("vin_ordinnaire.csv", index=False)
+      df_erp.to_csv("erp_zscore.csv", index=False)
+    outputFiles:
+      - vin_premium.csv
+      - vin_ordinnaire.csv
+      - erp_zscore.csv
+
+  - id: check_stats_zscore
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    description: vérifie les propriétés mathématiques attendues du z-score
+    inputFiles:
+      erp_zscore.csv: "{{ outputs.zscore.outputFiles['erp_zscore.csv'] }}"
+    fetchType: FETCH_ONE
+    sql: |
+      SELECT
+        ROUND(AVG(z_score), 4) AS moyenne,
+        ROUND(STDDEV_SAMP(z_score), 4) AS ecart_type,
+        COUNT(*) FILTER (WHERE z_score IS NULL) AS nb_null
+      FROM read_csv_auto('{{ workingDir }}/erp_zscore.csv', header=True);
+
+  - id: assert_stats_zscore
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.check_stats_zscore.row.moyenne  < 0.01 }}"
+      - "{{ (outputs.check_stats_zscore.row.ecart_type - 1) < 0.01 }}"
+      - "{{ outputs.check_stats_zscore.row.nb_null == 0 }}"
+    errorMessage: "Z-score invalide : moyenne={{ outputs.check_stats_zscore.row.moyenne }} (attendu ~0), écart-type={{ outputs.check_stats_zscore.row.ecart_type }} (attendu ~1)."
+
+  - id: check_vin_premium
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    inputFiles:
+      premium.csv: "{{ outputs.zscore.outputFiles['vin_premium.csv'] }}"
+    fetchType: FETCH_ONE          
+    sql: "SELECT COUNT(*) AS nb FROM read_csv_auto('{{ workingDir }}/premium.csv', header=True);"
+
+  - id: assert_vin_premium
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ outputs.check_vin_premium.row.nb == 30 }}"
+    errorMessage: "Premium.csv n'a pas le bon nombre de lignes, ({{ outputs.check_vin_premium.row.nb }} au lieu de 30)."
+
